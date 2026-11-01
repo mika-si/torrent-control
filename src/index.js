@@ -104,31 +104,245 @@ function addTorrent(url, tabId, torrentOptions = {}) {
     }
 }
 
+function parseTorrentFilename(header, url) {
+    if (header) {
+        const star = header.match(/filename\*\s*=\s*(?:UTF-8|utf-8)'[^']*'([^;]+)/i);
+        if (star) {
+            try { return decodeURIComponent(star[1].trim()); } catch (e) {}
+        }
+        const quoted = header.match(/filename\s*=\s*"([^"]+)"/i);
+        if (quoted) return quoted[1];
+        const plain = header.match(/filename\s*=\s*([^;]+)/i);
+        if (plain) return plain[1].trim();
+    }
+
+    try {
+        const pathname = new URL(url).pathname;
+        const filename = decodeURIComponent(pathname.split('/').pop());
+        return filename.endsWith('.torrent') ? filename : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function waitForTabComplete(tabId, timeoutMs = 30000) {
+    return new Promise((resolve, reject) => {
+        let timer;
+        const cleanup = () => {
+            clearTimeout(timer);
+            browser.tabs.onUpdated.removeListener(onUpdated);
+        };
+        const onUpdated = (updatedTabId, changeInfo, tab) => {
+            if (updatedTabId === tabId && changeInfo.status === 'complete') {
+                cleanup();
+                resolve(tab);
+            }
+        };
+
+        browser.tabs.onUpdated.addListener(onUpdated);
+        timer = setTimeout(() => {
+            cleanup();
+            reject(new Error('Timed out waiting for the background tab to load'));
+        }, timeoutMs);
+
+        browser.tabs.get(tabId).then((tab) => {
+            if (tab.status === 'complete') {
+                cleanup();
+                resolve(tab);
+            }
+        }).catch((error) => {
+            cleanup();
+            reject(error);
+        });
+    });
+}
+
+async function fetchTorrentInBackgroundTab(url, sourceTabId) {
+    if (!browser.webRequest || typeof browser.webRequest.filterResponseData !== 'function') {
+        throw new Error('This Firefox version does not support webRequest.filterResponseData');
+    }
+    // Duplicate the source tab so the request uses the same Firefox container
+    // and the download navigation has the details page as its referrer.
+    // Open a temporary inactive tab in the same Firefox container.
+    // Unlike tabs.hide(), active:false does not require the tabHide permission
+    // or trigger Firefox's extension tab-hiding warning.
+    const backgroundTab = await browser.tabs.duplicate(sourceTabId, {active: false});
+    const tabId = backgroundTab.id;
+    let filter = null;
+    let activeFilterState = null;
+    let activeRequestId = null;
+    let settled = false;
+    let timeout;
+    let resolveDownload;
+    let rejectDownload;
+
+    const resultPromise = new Promise((resolve, reject) => {
+        resolveDownload = resolve;
+        rejectDownload = reject;
+    });
+
+    const cleanup = async () => {
+        clearTimeout(timeout);
+        browser.webRequest.onBeforeRequest.removeListener(onBeforeRequest);
+        browser.webRequest.onHeadersReceived.removeListener(onHeadersReceived);
+        browser.webRequest.onErrorOccurred.removeListener(onErrorOccurred);
+        try { await browser.tabs.remove(tabId); } catch (e) {}
+    };
+
+    const finish = async (error, result) => {
+        if (settled) return;
+        settled = true;
+        await cleanup();
+        if (error) rejectDownload(error);
+        else resolveDownload(result);
+    };
+
+    const onBeforeRequest = (details) => {
+        if (details.tabId !== tabId || details.type !== 'main_frame') return;
+        if (details.url !== url) return;
+
+        activeRequestId = details.requestId;
+        try {
+            const state = {chunks: [], totalBytes: 0, passedThrough: false, meta: {}};
+            const requestFilter = browser.webRequest.filterResponseData(details.requestId);
+            state.filter = requestFilter;
+            activeFilterState = state;
+            filter = requestFilter;
+
+            requestFilter.ondata = (event) => {
+                if (state.passedThrough) return;
+                const chunk = new Uint8Array(event.data);
+                state.chunks.push(chunk);
+                state.totalBytes += chunk.byteLength;
+            };
+            requestFilter.onerror = () => {
+                if (!state.passedThrough) finish(new Error('Failed while reading the torrent response'));
+            };
+            requestFilter.onstop = () => {
+                if (state.passedThrough) return;
+                // Do not let Firefox save the same torrent as a second download.
+                try { requestFilter.close(); } catch (e) {}
+                const bytes = new Uint8Array(state.totalBytes);
+                let offset = 0;
+                for (const chunk of state.chunks) {
+                    bytes.set(chunk, offset);
+                    offset += chunk.byteLength;
+                }
+                const content = new Blob([bytes], {type: (state.meta.contentType || 'application/octet-stream')});
+                finish(null, {
+                    ok: state.meta.status >= 200 && state.meta.status < 300,
+                    status: state.meta.status,
+                    statusText: state.meta.statusText,
+                    filename: parseTorrentFilename(state.meta.disposition, url),
+                    content: content,
+                });
+            };
+        } catch (error) {
+            finish(error);
+        }
+    };
+
+    const onHeadersReceived = (details) => {
+        if (details.tabId !== tabId || details.requestId !== activeRequestId) return;
+
+        const headers = details.responseHeaders || [];
+        const getHeader = (name) => {
+            const header = headers.find((item) => item.name.toLowerCase() === name);
+            return header ? header.value : '';
+        };
+        const contentType = getHeader('content-type').split(';')[0].toLowerCase();
+        const cfMitigated = getHeader('cf-mitigated').toLowerCase();
+
+        // Cloudflare may return an HTML challenge instead of the torrent.
+        // Let Firefox load that page normally so its JavaScript can run and
+        // Cloudflare can set/refresh clearance. The browser may then retry the
+        // original download URL; that subsequent torrent response is captured.
+        if (cfMitigated === 'challenge' || contentType === 'text/html' || contentType === 'application/xhtml+xml') {
+            if (activeFilterState) {
+                activeFilterState.passedThrough = true;
+                try { activeFilterState.filter.disconnect(); } catch (e) {}
+            }
+            activeFilterState = null;
+            filter = null;
+            activeRequestId = null;
+            return;
+        }
+
+        const requestMeta = {
+            status: details.statusCode,
+            statusText: details.statusLine || '',
+            contentType: contentType,
+            disposition: getHeader('content-disposition'),
+        };
+        if (activeFilterState) activeFilterState.meta = requestMeta;
+
+        // Suppress the browser's own attachment/download handling. The filter
+        // captures the bytes for Torrent Control instead.
+        return {
+            responseHeaders: headers.filter((header) =>
+                !['content-disposition', 'content-length'].includes(header.name.toLowerCase())
+            ).map((header) => header.name.toLowerCase() === 'content-type'
+                ? {...header, value: 'text/plain; charset=utf-8'}
+                : header),
+        };
+    };
+
+    const onErrorOccurred = (details) => {
+        if (details.tabId === tabId && details.requestId === activeRequestId) {
+            finish(new Error('Torrent request failed: ' + details.error));
+        }
+    };
+
+    try {
+        await waitForTabComplete(tabId);
+
+        browser.webRequest.onBeforeRequest.addListener(
+            onBeforeRequest,
+            {urls: ['<all_urls>'], types: ['main_frame']},
+            ['blocking']
+        );
+        browser.webRequest.onHeadersReceived.addListener(
+            onHeadersReceived,
+            {urls: ['<all_urls>'], types: ['main_frame']},
+            ['blocking', 'responseHeaders']
+        );
+        browser.webRequest.onErrorOccurred.addListener(
+            onErrorOccurred,
+            {urls: ['<all_urls>'], types: ['main_frame']}
+        );
+
+        timeout = setTimeout(() => finish(new Error('Timed out downloading torrent')), 60000);
+        await browser.tabs.update(tabId, {url: url});
+        return await resultPromise;
+    } catch (error) {
+        await cleanup();
+        throw error;
+    }
+}
+
 export function fetchTorrent(url, tabId) {
     return new Promise(async (resolve, reject) => {
         if (tabId === null || await tabExists(tabId) === false) {
             return reject(new Error(chrome.i18n.getMessage('sourceTabDestroyedError')));
         }
 
-        chrome.tabs.sendMessage(tabId, {
-            type: 'fetchTorrent',
-            url: url,
-        }, (response) => {
-            if (response instanceof Error)
-                return reject(response);
-
-            if (!response.ok)
+        try {
+            const response = await fetchTorrentInBackgroundTab(url, tabId);
+            if (!response.ok) {
                 return reject(new Error(chrome.i18n.getMessage('torrentFetchError', response.status.toString() + ': ' + response.statusText)));
-
-            if (response.content.type !== '' && !response.content.type.match(/(application\/x-bittorrent|application\/octet-stream)/gi))
+            }
+            if (response.content.type !== '' && !response.content.type.match(/(application\/x-bittorrent|application\/octet-stream)/gi)) {
                 return reject(new Error(chrome.i18n.getMessage('torrentParseError', 'Unknown type: ' + response.content.type)));
+            }
 
             getTorrentName(response.content).then((name) => resolve({
                 torrent: response.content,
                 torrentName: name,
                 filename: response.filename || null,
-            }));
-        })
+            })).catch(reject);
+        } catch (error) {
+            reject(error);
+        }
     });
 }
 
