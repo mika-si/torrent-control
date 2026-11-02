@@ -42,10 +42,11 @@ async function listener(request) {
     }
 
     try {
-        const response = await fetch(request.url, {
-            headers: new Headers({
+        const fetchContext = typeof content !== 'undefined' && typeof content.fetch === 'function' ? content : globalThis;
+        const response = await fetchContext.fetch(request.url, {
+            headers: {
                 'accept': 'application/x-bittorrent,application/octet-stream,*/*',
-            }),
+            },
         });
 
         const contentDisposition = response.headers.get('content-disposition');
