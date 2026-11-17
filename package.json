@@ -12,12 +12,12 @@
   },
   "devDependencies": {
     "@types/chai": "^5.2.3",
-    "@types/chrome": "^0.2.2",
+    "@types/chrome": "^0.3.7",
     "@types/mocha": "^10.0.10",
     "@types/sinon": "^22.0.0",
     "chai": "^6.2.2",
-    "jsdom": "^29.1.1",
-    "mocha": "^11.7.5",
+    "jsdom": "^31.0.1",
+    "mocha": "^12.0.3",
     "sinon": "^22.0.0",
     "sinon-chrome": "^3.0.1",
     "web-ext": "^10.1.0"
