@@ -42,10 +42,16 @@ async function listener(request) {
     }
 
     try {
-        const response = await fetch(request.url, {
-            headers: new Headers({
+        // In Firefox a content script's own fetch() is sent as the extension, and some
+        // sites behind Cloudflare answer that with 403. content.fetch()
+        // sends the request as the page itself, exactly like the site's own scripts.
+        const pageFetch = (typeof content !== 'undefined' && content && typeof content.fetch === 'function')
+            ? content.fetch.bind(content)
+            : fetch;
+        const response = await pageFetch(request.url, {
+            headers: {
                 'accept': 'application/x-bittorrent,application/octet-stream,*/*',
-            }),
+            },
         });
 
         const contentDisposition = response.headers.get('content-disposition');
